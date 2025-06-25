@@ -4182,7 +4182,6 @@ class TestSDPAXpuOnly(NNTestCase):
         for permute_order in permute_orders:
             test_attention(list(permute_order) + [3])
 
-
     def test_scaled_dot_product_attention_fused_kernels_safe_softmax(self, device):
         dtype = torch.bfloat16
         make_tensor = partial(torch.rand, device=device, dtype=dtype, requires_grad=False)
