@@ -602,6 +602,7 @@ libtorch_nativert_sources = [
     "torch/nativert/executor/ExecutionPlanner.cpp",
     "torch/nativert/executor/ExecutionFrame.cpp",
     "torch/nativert/executor/GraphExecutorBase.cpp",
+    "torch/nativert/executor/ConstantFolder.cpp",
     "torch/nativert/executor/OpKernel.cpp",
     "torch/nativert/executor/PlacementUtils.cpp",
     "torch/nativert/executor/SerialGraphExecutor.cpp",
@@ -617,6 +618,7 @@ libtorch_nativert_sources = [
     "torch/nativert/executor/ParallelGraphExecutor.cpp",
     "torch/nativert/kernels/CallTorchBindKernel.cpp",
     "torch/nativert/kernels/PrimKernelRegistry.cpp",
+    "torch/nativert/executor/memory/DisjointStorageGroups.cpp",
 ]
 
 torch_mobile_tracer_sources = [
