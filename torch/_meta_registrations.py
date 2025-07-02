@@ -2407,6 +2407,43 @@ def meta__fused_moving_avg_obs_fq_helper(
     return (torch.empty_like(self), mask)
 
 
+@register_meta(aten._fused_moving_avg_obs_fq_helper_functional)
+def meta__fused_moving_avg_obs_fq_helper_functional(
+    self,
+    observer_on,
+    fake_quant_on,
+    running_min,
+    running_max,
+    scale,
+    zero_point,
+    averaging_const,
+    quant_min,
+    quant_max,
+    ch_axis,
+    per_row_fake_quant=False,
+    symmetric_quant=False,
+):
+    torch._check(
+        ch_axis < self.dim(),
+        lambda: "Error in fused_moving_avg_obs_fake_quant_cpu: ch_axis must be < self.dim()",
+    )
+
+    running_min_clone = torch.empty_like(running_min)
+    running_max_clone = torch.empty_like(running_max)
+    scale_clone = torch.empty_like(scale)
+    zero_point_clone = torch.empty_like(zero_point)
+    
+    if per_row_fake_quant and running_min_clone.numel() == 0:
+        size = self.size(ch_axis)
+        print(f"size: {size}")
+        running_min_clone.resize_(size)
+        running_max_clone.resize_(size)
+        scale_clone.resize_(size)
+        zero_point_clone.resize_(size)
+    mask = torch.empty_like(self, dtype=torch.bool)
+    return (torch.empty_like(self), mask,running_min_clone, running_max_clone, scale_clone, zero_point_clone)
+
+
 @register_meta(aten.mm)
 @out_wrapper(exact_dtype=True)
 def meta_mm(a, b):
