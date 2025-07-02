@@ -7222,10 +7222,7 @@ class FallbackKernel(ExternKernelAlloc):
 
     @classmethod
     def create(cls, kernel, *args, **kwargs):  # type: ignore[no-untyped-def]
-        fake_incorrect_kernels = (aten._fused_moving_avg_obs_fq_helper_functional,)
-        context: AbstractContextManager[None] = (
-            V.graph.fake_mode if kernel not in fake_incorrect_kernels else nullcontext()  # type: ignore[assignment]
-        )
+        context: AbstractContextManager[None] = V.graph.fake_mode
         with context:
             (
                 example_output,
