@@ -2827,6 +2827,19 @@ def tdm_descriptor_row_major(mat: IRNode) -> bool | None:
     return _tdm_row_major_from_strides(strides_i)
 
 
+def tdm_bmm_descriptor_row_major(mat: IRNode) -> bool | None:
+    """Classify a rank-3 bmm operand by the unit-stride dimension of its 2D slice."""
+    from .virtualized import V
+
+    strides = mat.get_stride()
+    if len(strides) != 3:
+        return None
+    strides_i = [
+        V.graph.sizevars.replace_backed_symbols_with_hints(st) for st in strides[1:]
+    ]
+    return _tdm_row_major_from_strides(strides_i)
+
+
 def _tdm_operand_policy_violation(
     mat: IRNode,
     accepted_dtypes: OrderedSet[torch.dtype],
@@ -3179,25 +3192,77 @@ def use_triton_xpu_template(*matrices: IRNode, layout: Layout) -> bool:
     return _xpu_descriptor_operands_compatible(matrices)
 
 
+def _xpu_bmm_descriptor_operands_compatible(matrices: Sequence[IRNode]) -> bool:
+    """Rank-3 analogue of _xpu_descriptor_operands_compatible; batch stride offsets
+    the base."""
+    from .virtualized import V
+
+    sizevars = V.graph.sizevars
+    conditions = []
+    for mat in matrices:
+        strides = mat.get_stride()
+        if len(strides) != 3 or mat.get_name() in V.graph.unaligned_buffers:
+            return False
+        row_major = tdm_bmm_descriptor_row_major(mat)
+        if row_major is None:
+            return False
+        inner, outer = (
+            (strides[2], strides[1]) if row_major else (strides[1], strides[2])
+        )
+        conditions.append(sympy.Eq(inner, 1))
+        itemsize = mat.get_dtype().itemsize
+        # The batch stride is a byte pitch of the rank-3 descriptor too, so it has
+        # to be 16-byte aligned exactly like the two inner ones.
+        for nbytes in (
+            outer * itemsize,
+            strides[0] * itemsize,
+            mat.get_layout().offset * itemsize,
+        ):
+            if not _bytes_aligned(sizevars.replace_backed_symbols_with_hints(nbytes)):
+                return False
+            conditions.append(sympy.Eq(Mod(nbytes, TMA_ALIGNMENT), 0))
+
+    if not _descriptor_shapes_fit_in_int32(
+        [mat.get_size()[1:] for mat in matrices], add_guards=True
+    ):
+        return False
+    condition = sympy.And(*conditions)
+    return sizevars.statically_known_true(condition) or sizevars.guard_or_false(
+        condition
+    )
+
+
+def use_triton_xpu_bmm_template(mat1: IRNode, mat2: IRNode, *, layout: Layout) -> bool:
+    """Whether the XPU bmm templates may take this BF16/FP16 bmm (Xe2+)."""
+    if not _xpu_descriptor_template_device_ok(layout):
+        return False
+    return _xpu_bmm_descriptor_operands_compatible((mat1, mat2))
+
+
 def xpu_descriptor_store_compatible(layout: Layout) -> bool:
-    """Whether the XPU mm templates can write this 2D output through a tensor
-    descriptor (unit inner stride, 16-byte aligned row stride and offset).
+    """Whether the XPU mm/bmm templates can write this output through a tensor
+    descriptor (unit inner stride, 16-byte aligned outer strides and offset).
 
     Operand admission does not imply this: with a column-major mat2 nothing
     constrains N, so the output row pitch can be unaligned.
+
+    Rank 3 is the batched bmm output `[B, M, N]`, which the bmm template stores
+    through a rank-3 descriptor with a batch block of 1. There every non-innermost
+    stride is a byte pitch the descriptor has to encode, so all of them - the
+    per-row N and the per-batch M*N - must be 16-byte aligned.
     """
     from .virtualized import V
 
     sizevars = V.graph.sizevars
     strides = layout.stride
-    if (
-        len(strides) != 2
-        or sizevars.replace_backed_symbols_with_hints(strides[1]) != 1
-    ):
+    if len(strides) not in (2, 3):
+        return False
+    if sizevars.replace_backed_symbols_with_hints(strides[-1]) != 1:
         return False
     itemsize = layout.dtype.itemsize
-    conditions = [sympy.Eq(strides[1], 1)]
-    for nbytes in (strides[0] * itemsize, layout.offset * itemsize):
+    conditions = [sympy.Eq(strides[-1], 1)]
+    byte_pitches = [stride * itemsize for stride in strides[:-1]]
+    for nbytes in (*byte_pitches, layout.offset * itemsize):
         if not _bytes_aligned(sizevars.replace_backed_symbols_with_hints(nbytes)):
             return False
         conditions.append(sympy.Eq(Mod(nbytes, TMA_ALIGNMENT), 0))

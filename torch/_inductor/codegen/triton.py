@@ -4956,7 +4956,20 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         #     YBLOCK, XBLOCK]. This protects against implicit broadcasting from loads.
         #  2. In case the block pointer / tma descriptor has different dimensionality, broadcast/reshape the
         #     result to the shape of the pointer.
-        value = f"tl.broadcast_to({value}, {indexing.final_shape})"
+        # A broadcast that is already a no-op costs more than the empty operation it
+        # looks like: Triton does not fold it before the block-store lowering, and
+        # the XPU backend then gives up on the 2D block store and emits one scatter
+        # store per element (verified: 4 block stores -> 75 scatter stores, 1.11x
+        # slower on a bmm 80x381x640@80x640x1280 epilogue). Skip it when the value
+        # already has the target shape.
+        final_shape = indexing.final_shape
+        value_shape = getattr(value, "shape", None)
+        if not (
+            value_shape is not None
+            and len(value_shape) == len(final_shape)
+            and all(str(v) == str(f) for v, f in zip(value_shape, final_shape))
+        ):
+            value = f"tl.broadcast_to({value}, {final_shape})"
 
         # If the strides have a non-trivial sort, then the broadcasting dims
         # need to be reverted for the store

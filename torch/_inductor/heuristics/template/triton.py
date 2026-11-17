@@ -24,7 +24,11 @@ from torch.utils._triton import has_triton_stable_tma_api
 
 from ... import config
 from ...autows_utils import has_two_ctas, meta_ws_enabled
-from ...kernel.bmm import bmm_template
+from ...kernel.bmm import (
+    bmm_template,
+    xpu_non_persistent_bmm_template,
+    xpu_persistent_bmm_template,
+)
 from ...kernel.mm import (
     blackwell_ws_persistent_tma_mm_template,
     mm_template,
@@ -52,10 +56,12 @@ from ...utils import (
     kpack_supported,
     mfma_kdim,
     rocm_gfx_arch,
+    tdm_bmm_descriptor_row_major,
     tdm_descriptor_row_major,
     TMA_DESCRIPTOR_SIZE,
     tma_inner_dim,
     triton_type,
+    use_triton_xpu_bmm_template,
     use_triton_xpu_template,
     using_b200,
     using_rocm_rdna3,
@@ -195,16 +201,19 @@ def _tdm_descriptor_block_fits_k(k: Any, block_k: int) -> bool:
     boxes the hardware walks are ``BLOCK_K`` long. When ``BLOCK_K > K`` a K-dim
     block load reads ``(BLOCK_K - K) * dtype_size`` bytes past the end of every
     row of A/B. For fp16 with K=80 and BLOCK_K=128 that is a 96-byte overrun per
-    row, and it is enough to reset the GPU.
+    row, and it is enough to reset the GPU: a bmm over the workload's
+    ``bmm(80x381x80, 80x80x640)`` autotune pool faults with the Xe2 driver's
+    page-not-present fault and then reports DEVICE_LOST, after which every
+    launch fails with OUT_OF_RESOURCES.
 
     Whether the overrun faults depends on the allocator's segment layout, so it
     is not reliably reproducible on a single shape -- but it is never correct.
 
-    The templates mask the odd-column case with a pointer-load tail
+    The mm templates mask the odd-column case with a pointer-load tail
     (``K_MAIN = K // 2 * 2`` then ``if K_MAIN < K``), but that tail only covers
-    an odd K and does not make the descriptor box fit when ``K < BLOCK_K``.
-    Filter the block here rather than relying on the kernel source to clamp a box
-    that is out of range.
+    an odd K and does not make the descriptor box fit when ``K < BLOCK_K``. The
+    bmm templates have no K tail at all. Filter the block here rather than
+    relying on the kernel source to clamp a box that is out of range.
 
     Only blocks that are *provably* wider than K are rejected, so a symbolic K
     keeps the full pool instead of silently collapsing it.
@@ -2763,6 +2772,17 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
             GemmConfig(32, 256, 64, 1, 8),
             GemmConfig(32, 512, 128, 1, 16),
             GemmConfig(64, 64, 64, 2, 16),
+            # The pool above tops out at BM=64, which leaves the mid-M range
+            # (M in the low hundreds) with no wide tile at all. Measured on
+            # bmm(32x381x200, 32x200x1600): the pool's best is
+            # (32,256,64,1,8) at 238.5us, while (128,128,32,2,8) reaches
+            # 159.7us -- 1.49x, and it also wins 7 of the 24 workload bmm
+            # shapes. (128,256,32,2,16) is the runner-up on the same shape
+            # (171.0us) and wins 3. (64,128,64,2,16) is the sweep winner on
+            # three mm/addmm shapes where the pool only has BN=64.
+            GemmConfig(128, 128, 32, 2, 8),
+            GemmConfig(128, 256, 32, 2, 16),
+            GemmConfig(64, 128, 64, 2, 16),
         ]
         # For small M*N with a long K, where the tiles alone cannot fill the Xe
         # cores: each tile is split across `split_k` work-groups and the partials
@@ -4674,6 +4694,9 @@ class XPUMMTemplateConfigHeuristic(MMTemplateConfigMixin, XPUConfigHeuristic):
 
     # Used instead of mm_configs when the XPU mm templates take the mm: the
     # only triton_mm configs that still win next to them on BMG (Xe2).
+    # Also used for the bmm template (plain triton_bmm next to the XPU bmm
+    # descriptor templates): there it won 2/54 blocks and both winning configs
+    # are in this list, so the 23 -> 7 shrink costs nothing measurable.
     xpu_template_companion_configs = [
         GemmConfig(64, 32, 32, 5, 8),
         GemmConfig(64, 64, 16, 2, 4),
@@ -4696,13 +4719,18 @@ class XPUMMTemplateConfigHeuristic(MMTemplateConfigMixin, XPUConfigHeuristic):
         op_name: str,
         **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
-        if (
-            op_name in ("mm", "addmm")
-            and config.max_autotune_gemm_search_space != "EXHAUSTIVE"
-            and _xpu_descriptor_row_major(kernel_inputs) is not None
-        ):
-            # A call-time keyword overrides the partial's configs=self.mm_configs.
-            kwargs["configs"] = self.xpu_template_companion_configs
+        if config.max_autotune_gemm_search_space != "EXHAUSTIVE":
+            # The 2D (mm/addmm) and 3D (bmm/baddbmm) descriptor templates have
+            # separate admission checks; each has its own rank in the strides.
+            if op_name in ("mm", "addmm"):
+                admitted = _xpu_descriptor_row_major(kernel_inputs) is not None
+            elif op_name in ("bmm", "baddbmm"):
+                admitted = _xpu_bmm_descriptor_row_major(kernel_inputs) is not None
+            else:
+                admitted = False
+            if admitted:
+                # A call-time keyword overrides the partial's configs=self.mm_configs.
+                kwargs["configs"] = self.xpu_template_companion_configs
         yield from super()._get_template_configs_impl(kernel_inputs, op_name, **kwargs)
 
 
@@ -4938,6 +4966,135 @@ class XPUAddmmNonPersistentMMTemplateConfigHeuristic(
     AddMMConfigMixin, XPUNonPersistentMMTemplateConfigHeuristic
 ):
     """Addmm specific mixin for the XPU non-persistent mm template"""
+
+
+def _xpu_bmm_descriptor_row_major(
+    kernel_inputs: KernelInputs,
+) -> dict[str, bool] | None:
+    """A_ROW_MAJOR / B_ROW_MAJOR for the XPU bmm descriptor templates, or None when
+    they do not take this bmm."""
+    if not isinstance(kernel_inputs, MMKernelInputs):
+        return None
+    mat1, mat2 = kernel_inputs.mat1mat2()
+    if not use_triton_xpu_bmm_template(
+        mat1, mat2, layout=kernel_inputs.output_layout()
+    ):
+        return None
+    return {
+        "A_ROW_MAJOR": bool(tdm_bmm_descriptor_row_major(mat1)),
+        "B_ROW_MAJOR": bool(tdm_bmm_descriptor_row_major(mat2)),
+    }
+
+
+class XPUDescriptorBMMTemplateConfigMixin(MMTemplateConfigMixin):
+    """Kwargs shared by the XPU bmm descriptor templates; subclasses set NUM_SMS.
+
+    Unlike the mm templates there is no K tail or split-K yet.
+    """
+
+    # Store the output tile through a rank-3 tensor descriptor when its layout
+    # allows it. A pointer store of the bf16/fp16 DPAS accumulator degenerates
+    # into per-element scatter (`store.ugm.d32x64t`), which costs 4.4x the scalar
+    # ALU ops, 2.1x the SEND messages and 4.2x the L3 write requests of one 2D
+    # block store, and leaves the DPAS engine at 56% instead of 74% utilization.
+    descriptor_store = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.should_scale_configs = False
+
+    def _num_sms(self) -> int:
+        return get_num_sms()
+
+    def _get_template_configs_impl(
+        self,
+        kernel_inputs: KernelInputs,
+        op_name: str,
+        **kwargs,
+    ) -> Generator[dict[str, Any], None, None]:
+        flags = _xpu_bmm_descriptor_row_major(kernel_inputs)
+        if flags is None:
+            return
+        dtype_size = kernel_inputs.dtype().itemsize
+        _m, _n, k = kernel_inputs.mnk_symbolic()
+        store_through_descriptor = (
+            self.descriptor_store
+            and xpu_descriptor_store_compatible(kernel_inputs.output_layout())
+        )
+        for template_kwargs in super()._get_template_configs_impl(
+            kernel_inputs, op_name, **kwargs
+        ):
+            if not _tdm_descriptor_blocks_aligned(
+                template_kwargs["BLOCK_M"],
+                template_kwargs["BLOCK_N"],
+                template_kwargs["BLOCK_K"],
+                dtype_size,
+                a_row_major=flags["A_ROW_MAJOR"],
+                b_row_major=flags["B_ROW_MAJOR"],
+                block_ok=_tdm_block_legal,
+            ):
+                continue
+            if not _tdm_descriptor_block_fits_k(k, template_kwargs["BLOCK_K"]):
+                continue
+            yield {
+                **template_kwargs,
+                **flags,
+                "NUM_SMS": self._num_sms(),
+                # `tma_store` is bound by TritonTemplate.generate's signature and
+                # only sets kernel.tma_store; the jinja source sees the kwargs, so
+                # it needs its own copy of the flag under a name it can read.
+                "tma_store": store_through_descriptor,
+                "TMA_STORE": store_through_descriptor,
+            }
+
+
+@register_template_heuristic(xpu_persistent_bmm_template.uid, "xpu")
+class XPUPersistentBMMTemplateConfigHeuristic(
+    XPUDescriptorBMMTemplateConfigMixin, XPUConfigHeuristic
+):
+    """Persistent descriptor bmm template heuristic for XPU (Xe2/BMG)."""
+
+    descriptor_store = True
+
+    # A work-group walking at least this many K steps gets a barrier after each tile.
+    TILE_BARRIER_MIN_K_STEPS = 1024
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mm_configs = list(self.xpu_persistent_configs)
+        self.exhaustive_configs = self.mm_configs
+
+    def _get_template_configs_impl(
+        self,
+        kernel_inputs: KernelInputs,
+        op_name: str,
+        **kwargs,
+    ) -> Generator[dict[str, Any], None, None]:
+        for template_kwargs in super()._get_template_configs_impl(
+            kernel_inputs, op_name, **kwargs
+        ):
+            yield {
+                **template_kwargs,
+                "TILE_BARRIER_MIN_K_STEPS": self.TILE_BARRIER_MIN_K_STEPS,
+            }
+
+
+@register_template_heuristic(xpu_non_persistent_bmm_template.uid, "xpu")
+class XPUNonPersistentBMMTemplateConfigHeuristic(
+    XPUDescriptorBMMTemplateConfigMixin, XPUConfigHeuristic
+):
+    """Non-persistent descriptor bmm template heuristic for XPU."""
+
+    descriptor_store = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mm_configs = list(self.xpu_non_persistent_configs)
+        self.exhaustive_configs = self.mm_configs
+
+    def _num_sms(self) -> int:
+        # Above any reachable tile count, so the grid has one work-group per tile.
+        return 2**30
 
 
 @register_template_heuristic(mm_plus_mm_template.uid, "xpu")

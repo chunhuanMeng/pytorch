@@ -1368,6 +1368,10 @@ class SizeVarAllocator:
         ):
             return expr
         expr = self.remove_precomputed_replacements(expr)
+        # Unbacked sizes are bound by graph operations, not at wrapper entry.
+        # Keep their expressions explicit so kernel arguments retain dependencies.
+        if free_unbacked_symbols(expr):
+            return expr
         if expr not in self.precomputed_replacements:
             sym = sympy_index_symbol_with_prefix(
                 SymT.PRECOMPUTED_SIZE, len(self.precomputed_replacements)
